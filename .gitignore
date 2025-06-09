@@ -1,0 +1,7 @@
+# [FILE]
+.env
+
+# [DIR]
+scripts
+target
+pem
