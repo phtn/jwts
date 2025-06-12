@@ -1,17 +1,27 @@
 use reqwest::Client;
 use serde_json::json;
+use std::env;
+fn url(endpoint: &str) -> String {
+    let base = env::var("BASE_URL").expect("BASE_URL must be set");
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    )
+}
 
 #[tokio::test]
 async fn test_sign_and_verify_hs256_success() {
     let client = Client::new();
+    let endpoint = url("/sign");
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post(format!("{}", endpoint))
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"
@@ -24,7 +34,7 @@ async fn test_sign_and_verify_hs256_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post(format!("{}", url("/verify")))
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -38,13 +48,13 @@ async fn test_sign_and_verify_hs256_success() {
 async fn test_sign_with_unsupported_alg() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post(url("sign"))
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "FOO256"
@@ -61,7 +71,7 @@ async fn test_sign_with_unsupported_alg() {
 async fn test_verify_with_invalid_token() {
     let client = Client::new();
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post(format!("{}", url("/verify")))
         .json(&json!({ "token": "not.a.jwt" }))
         .send()
         .await
@@ -75,13 +85,13 @@ async fn test_verify_with_invalid_token() {
 async fn test_sign_and_verify_rs256_success() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post(format!("{}", url("/sign")))
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "rsa-key-1",
             "alg": "RS256"
@@ -94,7 +104,7 @@ async fn test_sign_and_verify_rs256_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post(format!("{}", url("/verify")))
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -108,13 +118,13 @@ async fn test_sign_and_verify_rs256_success() {
 async fn test_sign_and_verify_es256_success() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post(format!("{}", url("/sign")))
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "ec-key-1",
             "alg": "ES256"
@@ -127,7 +137,7 @@ async fn test_sign_and_verify_es256_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post(format!("{}", url("/verify")))
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -141,13 +151,13 @@ async fn test_sign_and_verify_es256_success() {
 async fn test_verify_with_expired_token() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1000, // expired
             "iat": 1000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"
@@ -160,7 +170,7 @@ async fn test_verify_with_expired_token() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -174,13 +184,13 @@ async fn test_verify_with_expired_token() {
 async fn test_verify_with_wrong_audience() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "not-my-audience",
+            "aud": "not-provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"
@@ -193,7 +203,7 @@ async fn test_verify_with_wrong_audience() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -213,13 +223,13 @@ async fn test_verify_with_wrong_audience() {
 async fn test_verify_with_tampered_token() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"
@@ -235,7 +245,7 @@ async fn test_verify_with_tampered_token() {
     let tampered = format!("{}{}", token, if last == 'a' { 'b' } else { 'a' });
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": tampered }))
         .send()
         .await
@@ -250,13 +260,13 @@ async fn test_verify_with_tampered_token() {
 async fn test_sign_and_verify_ps256_success() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "pss-key-1",
             "alg": "PS256"
@@ -269,7 +279,7 @@ async fn test_sign_and_verify_ps256_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -283,13 +293,13 @@ async fn test_sign_and_verify_ps256_success() {
 async fn test_sign_and_verify_es384_success() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "ec-key-1",
             "alg": "ES384"
@@ -302,7 +312,7 @@ async fn test_sign_and_verify_es384_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -316,13 +326,13 @@ async fn test_sign_and_verify_es384_success() {
 async fn test_sign_and_verify_hs512_success() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS512"
@@ -335,7 +345,7 @@ async fn test_sign_and_verify_hs512_success() {
     let token = sign_json["token"].as_str().unwrap();
 
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": token }))
         .send()
         .await
@@ -349,7 +359,7 @@ async fn test_sign_and_verify_hs512_success() {
 async fn test_verify_with_missing_token_field() {
     let client = Client::new();
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({}))
         .send()
         .await
@@ -363,7 +373,7 @@ async fn test_verify_with_missing_token_field() {
 async fn test_verify_with_empty_token_string() {
     let client = Client::new();
     let verify_resp = client
-        .post("http://127.0.0.1:3000/verify")
+        .post("http://127.0.0.1:5000/verify")
         .json(&json!({ "token": "" }))
         .send()
         .await
@@ -377,13 +387,13 @@ async fn test_verify_with_empty_token_string() {
 async fn test_sign_with_missing_required_field() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             // missing sub
             "exp": 1999999999,
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"
@@ -398,13 +408,13 @@ async fn test_sign_with_missing_required_field() {
 async fn test_sign_with_invalid_exp_type() {
     let client = Client::new();
     let sign_resp = client
-        .post("http://127.0.0.1:3000/sign")
+        .post("http://127.0.0.1:5000/sign")
         .json(&json!({
             "sub": "user123",
             "exp": "notanumber",
             "iat": 1710000000,
             "iss": "my-issuer",
-            "aud": "my-audience",
+            "aud": "provider",
             "custom": "test",
             "kid": "hmac-key-1",
             "alg": "HS256"

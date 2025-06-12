@@ -1,6 +1,6 @@
 [package]
-name = "jwt"
-version = "0.1.0"
+name = "jwts"
+version = "0.1.32"
 edition = "2024"
 
 [dependencies]

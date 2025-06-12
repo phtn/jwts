@@ -1,5 +1,7 @@
 # [FILE]
 .env
+deploy.sh
+deploy-static.sh
 
 # [DIR]
 scripts

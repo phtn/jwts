@@ -11,5 +11,5 @@ t:
 	cargo test --test api
 
 b:
-	@cargo build --release && \
-	    clear && ./target/release/jwt
+	@cargo build --release && clear && \
+	    ./target/release/jwts

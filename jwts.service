@@ -1,0 +1,12 @@
+[Unit]
+Description=JWTS Rust Service
+After=network.target
+
+[Service]
+User=ec2-user
+ExecStart=/home/ec2-user/deploy/jwts
+Restart=on-failure
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target 
