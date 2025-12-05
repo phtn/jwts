@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -60,10 +60,44 @@ impl ApiError {
     }
 }
 
+// Helper to load key from file specified in env var
+fn load_key(env_var: &str) -> Result<Vec<u8>, ApiError> {
+    match env::var(env_var) {
+        Ok(path) => match fs::read(&path) {
+            Ok(key) => Ok(key),
+            Err(e) => {
+                error!("Failed to read key file at {}: {}", path, e);
+                Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "KeyAccessError",
+                    format!("Could not read key file specified in {}: {}", env_var, e),
+                ))
+            }
+        },
+        Err(_) => {
+            error!("Environment variable {} is not set", env_var);
+            Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MissingConfig",
+                format!("Environment variable {} is not set", env_var),
+            ))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    tracing_subscriber::fmt::init();
+
+    // We allow starting without JWT_SECRET if not using HS algorithms,
+    // but we should check it when needed.
+    // However, existing logic passes it to handlers.
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "".to_string());
+
+    if secret.is_empty() {
+        info!("JWT_SECRET not set. HMAC signing/verification will fail if attempted.");
+    }
 
     let app = Router::new()
         .route(
@@ -80,11 +114,12 @@ async fn main() -> anyhow::Result<()> {
                 move |payload| verify_jwt(payload, secret.clone())
             }),
         )
-        .route("/test_env", get(test_env));
+        .route("/getenvs", get(envs));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("𝚓𝚠𝚝𝚜 0.1.32");
+    info!("𝚓𝚠𝚝𝚜 0.1.32 listening on {}", addr);
 
     axum::serve(listener, app).await?;
 
@@ -104,132 +139,88 @@ async fn sign_jwt(Json(payload): Json<SignRequest>, secret: String) -> impl Into
     if let Some(kid) = payload.kid {
         header.kid = Some(kid);
     }
-    header.alg = payload.alg.parse().unwrap_or(Algorithm::HS256);
 
-    let result = match payload.alg.as_str() {
-        "HS256" => encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        ),
-        "HS384" => encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        ),
-        "HS512" => encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        ),
-        "RS256" | "RS384" | "RS512" => {
-            let private_key_path = std::env::var("JWT_PRIVATE_KEY").ok();
-            let private_key = match private_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
-            };
-            if let Some(key) = private_key {
-                match EncodingKey::from_rsa_pem(&key) {
-                    Ok(encoding_key) => encode(&header, &claims, &encoding_key),
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
+    let alg_enum = match payload.alg.parse::<Algorithm>() {
+        Ok(a) => a,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedAlgorithm",
+                format!("Algorithm '{}' is not supported", payload.alg),
+            )
+            .into_response();
+        }
+    };
+
+    header.alg = alg_enum;
+
+    let result = match alg_enum {
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+            if secret.is_empty() {
                 return ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable RSA private key",
+                    "MissingConfig",
+                    "JWT_SECRET is not configured for HMAC signing",
                 )
                 .into_response();
             }
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
         }
-        "ES256" | "ES384" => {
-            let ec_private_key_path = std::env::var("JWT_EC_PRIVATE_KEY").ok();
-            let ec_private_key = match ec_private_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+            let key_data = match load_key("JWT_PRIVATE_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
             };
-            if let Some(key) = ec_private_key {
-                match EncodingKey::from_ec_pem(&key) {
-                    Ok(encoding_key) => match encode(&header, &claims, &encoding_key) {
-                        Ok(token) => return Json(json!({ "token": token })).into_response(),
-                        Err(e) => {
-                            return ApiError::new(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "SignError",
-                                e.to_string(),
-                            )
-                            .into_response();
-                        }
-                    },
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable EC private key",
-                )
-                .into_response();
+            match EncodingKey::from_rsa_pem(&key_data) {
+                Ok(k) => encode(&header, &claims, &k),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)), // Convert to jsonwebtoken Error to match arm types
             }
         }
-        "PS256" | "PS384" | "PS512" => {
-            let pss_private_key_path = std::env::var("JWT_PSS_PRIVATE_KEY").ok();
-            let pss_private_key = match pss_private_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
+        Algorithm::ES256 | Algorithm::ES384 => {
+            let key_data = match load_key("JWT_EC_PRIVATE_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
             };
-            if let Some(key) = pss_private_key {
-                match EncodingKey::from_rsa_pem(&key) {
-                    Ok(encoding_key) => encode(&header, &claims, &encoding_key),
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable PSS private key",
-                )
-                .into_response();
+            match EncodingKey::from_ec_pem(&key_data) {
+                Ok(k) => encode(&header, &claims, &k),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
+            }
+        }
+        Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512 => {
+            let key_data = match load_key("JWT_PSS_PRIVATE_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
+            };
+            match EncodingKey::from_rsa_pem(&key_data) {
+                Ok(k) => encode(&header, &claims, &k),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
             }
         }
         _ => {
             return ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "UnsupportedAlgorithm",
-                "Unsupported algorithm",
+                format!("Algorithm '{:?}' is not supported", alg_enum),
             )
             .into_response();
         }
     };
+
     match result {
         Ok(token) => Json(json!({"token": token})).into_response(),
-        Err(e) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SignError",
-            e.to_string(),
-        )
-        .into_response(),
+        Err(e) => {
+            error!("Signing error: {}", e);
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SignError",
+                format!("Failed to sign token: {}", e),
+            )
+            .into_response()
+        }
     }
 }
 
@@ -237,8 +228,12 @@ async fn verify_jwt(Json(payload): Json<VerifyRequest>, secret: String) -> impl 
     let header = match jsonwebtoken::decode_header(&payload.token) {
         Ok(h) => h,
         Err(e) => {
-            return ApiError::new(StatusCode::BAD_REQUEST, "InvalidTokenHeader", e.to_string())
-                .into_response();
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidTokenHeader",
+                format!("Could not decode header: {}", e),
+            )
+            .into_response();
         }
     };
     let alg = header.alg;
@@ -246,191 +241,149 @@ async fn verify_jwt(Json(payload): Json<VerifyRequest>, secret: String) -> impl 
     if let Ok(aud) = env::var("AUDIENCE") {
         validation.set_audience(&[aud]);
     }
+
+    // Attempt to decode
     let result = match alg {
-        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => decode::<Claims>(
-            &payload.token,
-            &DecodingKey::from_secret(secret.as_bytes()),
-            &validation,
-        ),
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-            let public_key_path = env::var("JWT_PUBLIC_KEY").ok();
-            let public_key = match public_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
-            };
-            if let Some(key) = public_key {
-                match DecodingKey::from_rsa_pem(&key) {
-                    Ok(decoding_key) => {
-                        decode::<Claims>(&payload.token, &decoding_key, &validation)
-                    }
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+            if secret.is_empty() {
                 return ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable RSA public key",
+                    "MissingConfig",
+                    "JWT_SECRET is not configured for HMAC verification",
                 )
                 .into_response();
+            }
+            decode::<Claims>(
+                &payload.token,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            )
+        }
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+            let key_data = match load_key("JWT_PUBLIC_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
+            };
+            match DecodingKey::from_rsa_pem(&key_data) {
+                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
             }
         }
         Algorithm::ES256 | Algorithm::ES384 => {
-            let ec_public_key_path = std::env::var("JWT_EC_PUBLIC_KEY").ok();
-            let ec_public_key = match ec_public_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
+            let key_data = match load_key("JWT_EC_PUBLIC_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
             };
-            if let Some(key) = ec_public_key {
-                match DecodingKey::from_ec_pem(&key) {
-                    Ok(decoding_key) => {
-                        decode::<Claims>(&payload.token, &decoding_key, &validation)
-                    }
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable EC public key",
-                )
-                .into_response();
+            match DecodingKey::from_ec_pem(&key_data) {
+                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
             }
         }
         Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512 => {
-            let pss_public_key_path = std::env::var("JWT_PSS_PUBLIC_KEY").ok();
-            let pss_public_key = match pss_public_key_path {
-                Some(path) => fs::read(path).ok(),
-                None => None,
+            let key_data = match load_key("JWT_PSS_PUBLIC_KEY") {
+                Ok(k) => k,
+                Err(e) => return e.into_response(),
             };
-            if let Some(key) = pss_public_key {
-                match DecodingKey::from_rsa_pem(&key) {
-                    Ok(decoding_key) => {
-                        decode::<Claims>(&payload.token, &decoding_key, &validation)
-                    }
-                    Err(e) => {
-                        return ApiError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InvalidKeyFormat",
-                            e.to_string(),
-                        )
-                        .into_response();
-                    }
-                }
-            } else {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingKey",
-                    "Missing or unreadable PSS public key",
-                )
-                .into_response();
+            match DecodingKey::from_rsa_pem(&key_data) {
+                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
+                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
             }
         }
         _ => {
             return ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "UnsupportedAlgorithm",
-                "Unsupported algorithm",
+                format!("Algorithm '{:?}' is not supported", alg),
             )
             .into_response();
         }
     };
+
     match result {
         Ok(data) => Json(json!({"claims": data.claims})).into_response(),
         Err(err) => {
-            println!("JWT verification error: {:?}", err);
-            let error_type = match err.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => "ExpiredSignature",
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => "InvalidSignature",
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => "InvalidAudience",
-                _ => "InvalidToken",
-            };
-            let error_msg = match err.kind() {
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                    "Invalid signature".to_string()
-                }
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => "Invalid audience".to_string(),
-                _ => err.to_string(),
-            };
-            let status = match err.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => StatusCode::UNAUTHORIZED,
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => StatusCode::UNAUTHORIZED,
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => StatusCode::BAD_REQUEST,
-                _ => StatusCode::BAD_REQUEST,
+            error!("JWT verification error: {:?}", err);
+            let kind = err.kind();
+            let (status, error_type, error_msg) = match kind {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => (
+                    StatusCode::UNAUTHORIZED,
+                    "ExpiredSignature",
+                    "Token has expired".to_string(),
+                ),
+                jsonwebtoken::errors::ErrorKind::InvalidSignature => (
+                    StatusCode::UNAUTHORIZED,
+                    "InvalidSignature",
+                    "Invalid signature".to_string(),
+                ),
+                jsonwebtoken::errors::ErrorKind::InvalidAudience => (
+                    StatusCode::BAD_REQUEST,
+                    "InvalidAudience",
+                    "Invalid audience".to_string(),
+                ),
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer => (
+                    StatusCode::BAD_REQUEST,
+                    "InvalidIssuer",
+                    "Invalid issuer".to_string(),
+                ),
+                jsonwebtoken::errors::ErrorKind::ImmatureSignature => (
+                    StatusCode::BAD_REQUEST,
+                    "ImmatureSignature",
+                    "Token is not yet valid (nbf claim)".to_string(),
+                ),
+                jsonwebtoken::errors::ErrorKind::InvalidToken => (
+                    StatusCode::BAD_REQUEST,
+                    "InvalidToken",
+                    "Token is malformed or invalid".to_string(),
+                ),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    "VerificationError",
+                    err.to_string(),
+                ),
             };
             ApiError::new(status, error_type, error_msg).into_response()
         }
     }
 }
 
-async fn test_env() -> impl IntoResponse {
-    let jwt_secret = env::var("JWT_SECRET").ok();
-    let jwt_private_key = env::var("JWT_PRIVATE_KEY").ok();
-    let jwt_public_key = env::var("JWT_PUBLIC_KEY").ok();
-    let jwt_pss_private_key = env::var("JWT_PSS_PRIVATE_KEY").ok();
-    let jwt_pss_public_key = env::var("JWT_PSS_PUBLIC_KEY").ok();
-    let jwt_ec_private_key = env::var("JWT_EC_PRIVATE_KEY").ok();
-    let jwt_ec_public_key = env::var("JWT_EC_PUBLIC_KEY").ok();
+async fn envs() -> impl IntoResponse {
+    let vars = [
+        "JWT_SECRET",
+        "JWT_PRIVATE_KEY",
+        "JWT_PUBLIC_KEY",
+        "JWT_PSS_PRIVATE_KEY",
+        "JWT_PSS_PUBLIC_KEY",
+        "JWT_EC_PRIVATE_KEY",
+        "JWT_EC_PUBLIC_KEY",
+        "BASE_URL",
+        "AUDIENCE",
+    ];
 
-    let jwt_private_key_exists = jwt_private_key.as_ref().map(|p| Path::new(p).exists());
-    let jwt_public_key_exists = jwt_public_key.as_ref().map(|p| Path::new(p).exists());
-    let jwt_pss_private_key_exists = jwt_pss_private_key.as_ref().map(|p| Path::new(p).exists());
-    let jwt_pss_public_key_exists = jwt_pss_public_key.as_ref().map(|p| Path::new(p).exists());
-    let jwt_ec_private_key_exists = jwt_ec_private_key.as_ref().map(|p| Path::new(p).exists());
-    let jwt_ec_public_key_exists = jwt_ec_public_key.as_ref().map(|p| Path::new(p).exists());
+    let mut result = serde_json::Map::new();
 
-    println!("JWT_SECRET: {:?}", jwt_secret);
-    println!(
-        "JWT_PRIVATE_KEY: {:?} exists: {:?}",
-        jwt_private_key, jwt_private_key_exists
-    );
-    println!(
-        "JWT_PUBLIC_KEY: {:?} exists: {:?}",
-        jwt_public_key, jwt_public_key_exists
-    );
-    println!(
-        "JWT_PSS_PRIVATE_KEY: {:?} exists: {:?}",
-        jwt_pss_private_key, jwt_pss_private_key_exists
-    );
-    println!(
-        "JWT_PSS_PUBLIC_KEY: {:?} exists: {:?}",
-        jwt_pss_public_key, jwt_pss_public_key_exists
-    );
-    println!(
-        "JWT_EC_PRIVATE_KEY: {:?} exists: {:?}",
-        jwt_ec_private_key, jwt_ec_private_key_exists
-    );
-    println!(
-        "JWT_EC_PUBLIC_KEY: {:?} exists: {:?}",
-        jwt_ec_public_key, jwt_ec_public_key_exists
-    );
+    for var in vars {
+        let val = env::var(var).ok();
+        let exists = val.is_some();
+        let mut details = serde_json::Map::new();
+        details.insert("set".to_string(), json!(exists));
 
-    Json(serde_json::json!({
-        "JWT_SECRET": jwt_secret,
-        "JWT_PRIVATE_KEY": jwt_private_key,
-        "JWT_PRIVATE_KEY_EXISTS": jwt_private_key_exists,
-        "JWT_PUBLIC_KEY": jwt_public_key,
-        "JWT_PUBLIC_KEY_EXISTS": jwt_public_key_exists,
-        "JWT_PSS_PRIVATE_KEY": jwt_pss_private_key,
-        "JWT_PSS_PRIVATE_KEY_EXISTS": jwt_pss_private_key_exists,
-        "JWT_PSS_PUBLIC_KEY": jwt_pss_public_key,
-        "JWT_PSS_PUBLIC_KEY_EXISTS": jwt_pss_public_key_exists,
-        "JWT_EC_PRIVATE_KEY": jwt_ec_private_key,
-        "JWT_EC_PRIVATE_KEY_EXISTS": jwt_ec_private_key_exists,
-        "JWT_EC_PUBLIC_KEY": jwt_ec_public_key,
-        "JWT_EC_PUBLIC_KEY_EXISTS": jwt_ec_public_key_exists,
-    }))
+        if let Some(v) = val {
+            // mask secret
+            if var == "JWT_SECRET" {
+                details.insert("value".to_string(), json!("***"));
+            } else if var.contains("KEY") && !var.contains("PUBLIC") {
+                // Private key paths are shown, but maybe we want to check if file exists
+                details.insert("path".to_string(), json!(v));
+                details.insert("file_exists".to_string(), json!(Path::new(&v).exists()));
+            } else {
+                details.insert("value".to_string(), json!(v));
+                if var.contains("KEY") || var.contains("CERT") {
+                    details.insert("file_exists".to_string(), json!(Path::new(&v).exists()));
+                }
+            }
+        }
+        result.insert(var.to_string(), json!(details));
+    }
+
+    Json(result)
 }

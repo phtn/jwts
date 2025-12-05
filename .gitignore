@@ -7,3 +7,4 @@ deploy-static.sh
 scripts
 target
 pem
+pkg
