@@ -1,0 +1,38 @@
+# Build artifacts
+target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Environment files (never include secrets in image)
+.env
+.env.*
+
+# Test files
+tests/
+
+# Keys (should be mounted, not built into image)
+*.pem
+keys/
+
+# Development files
+Makefile
+notes.md
+static-binary.md
+
+# Docker files
+Dockerfile*
+docker-compose*.yml
+.dockerignore

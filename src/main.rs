@@ -1,389 +1,178 @@
-use axum::response::Response;
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get, routing::post};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::env;
-use std::fs;
-use std::net::SocketAddr;
-use std::path::Path;
-use tracing::{error, info};
+mod auth;
+mod config;
+mod error;
+mod keys;
+mod models;
+mod routes;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-    iat: usize,
-    iss: String,
-    aud: String,
-    custom: Option<String>,
-}
+use std::sync::Arc;
+use std::time::Duration;
 
-#[derive(Debug, Deserialize)]
-struct SignRequest {
-    sub: String,
-    exp: usize,
-    iat: usize,
-    iss: String,
-    aud: String,
-    custom: Option<String>,
-    kid: Option<String>,
-    alg: String,
-}
+use axum::{
+    extract::Request,
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+    Router,
+};
+use tower::ServiceBuilder;
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::GlobalKeyExtractor, GovernorLayer,
+};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::info;
 
-#[derive(Debug, Deserialize)]
-struct VerifyRequest {
-    token: String,
-}
+use crate::auth::middleware::should_skip_auth;
+use crate::config::Config;
+use crate::keys::{Jwks, KeyStore};
 
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    error_type: &'static str,
-    error_msg: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, error_type: &'static str, error_msg: impl Into<String>) -> Self {
-        Self {
-            status,
-            error_type,
-            error_msg: error_msg.into(),
-        }
-    }
-    fn into_response(self) -> Response {
-        let body = Json(json!({
-            "error_type": self.error_type,
-            "error_msg": self.error_msg,
-        }));
-        (self.status, body).into_response()
-    }
-}
-
-// Helper to load key from file specified in env var
-fn load_key(env_var: &str) -> Result<Vec<u8>, ApiError> {
-    match env::var(env_var) {
-        Ok(path) => match fs::read(&path) {
-            Ok(key) => Ok(key),
-            Err(e) => {
-                error!("Failed to read key file at {}: {}", path, e);
-                Err(ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "KeyAccessError",
-                    format!("Could not read key file specified in {}: {}", env_var, e),
-                ))
-            }
-        },
-        Err(_) => {
-            error!("Environment variable {} is not set", env_var);
-            Err(ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MissingConfig",
-                format!("Environment variable {} is not set", env_var),
-            ))
-        }
-    }
+/// Application state shared across handlers
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub key_store: KeyStore,
+    pub jwks: Jwks,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file if present
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt::init();
 
-    // We allow starting without JWT_SECRET if not using HS algorithms,
-    // but we should check it when needed.
-    // However, existing logic passes it to handlers.
-    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "".to_string());
+    // Initialize tracing with env filter
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "jwts=info,tower_http=info".into()),
+        )
+        .init();
 
-    if secret.is_empty() {
-        info!("JWT_SECRET not set. HMAC signing/verification will fail if attempted.");
+    // Load configuration
+    let config = Config::from_env();
+    config.log_summary();
+
+    // Load keys
+    let key_store = KeyStore::from_config(&config)?;
+    info!(
+        "Key store initialized: signing={}, verification={}",
+        key_store.has_signing_capability(),
+        key_store.has_verification_capability()
+    );
+
+    // Build JWKS
+    let jwks = Jwks::from_key_store(&key_store);
+    if !jwks.is_empty() {
+        info!("JWKS endpoint will serve {} key(s)", jwks.keys.len());
     }
 
+    // Build application state
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        key_store,
+        jwks,
+    };
+
+    // Build rate limiter
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(config.rate_limit_per_second)
+        .burst_size(config.rate_limit_burst)
+        .key_extractor(GlobalKeyExtractor)
+        // .key_extractor(PeerIpKeyExtractor)
+        .finish()
+        .expect("Failed to build rate limiter config");
+
+    let governor_limiter = governor_conf.limiter().clone();
+    let governor_layer = GovernorLayer {
+        config: Arc::new(governor_conf),
+    };
+
+    // API key for auth middleware
+    let api_key = config.api_key.clone();
+
+    // Build router
     let app = Router::new()
-        .route(
-            "/sign",
-            post({
-                let secret = secret.clone();
-                move |payload| sign_jwt(payload, secret.clone())
-            }),
-        )
-        .route(
-            "/verify",
-            post({
-                let secret = secret.clone();
-                move |payload| verify_jwt(payload, secret.clone())
-            }),
-        )
-        .route("/getenvs", get(envs));
+        // Public routes (no auth required)
+        .route("/health", get(routes::health::health))
+        .route("/ready", get(routes::health::ready))
+        .route("/.well-known/jwks.json", get(routes::jwks::get_jwks))
+        // Protected routes
+        .route("/sign", post(routes::sign::sign_jwt))
+        .route("/verify", post(routes::verify::verify_jwt))
+        .with_state(state)
+        // Apply middleware
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(CorsLayer::permissive())
+                .layer(governor_layer)
+                .layer(middleware::from_fn(move |req: Request, next: Next| {
+                    let api_key = api_key.clone();
+                    async move { auth_middleware(api_key, req, next).await }
+                })),
+        );
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+    // Get bind address
+    let addr = config.socket_addr();
 
+    // Setup graceful shutdown
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("𝚓𝚠𝚝𝚜 0.1.32 listening on {}", addr);
+    info!("jwts {} listening on {}", env!("CARGO_PKG_VERSION"), addr);
 
-    axum::serve(listener, app).await?;
+    // Start background task to periodically clear rate limiter state
+    let limiter = governor_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            limiter.retain_recent();
+        }
+    });
 
+    // Run server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("Server shutdown complete");
     Ok(())
 }
 
-async fn sign_jwt(Json(payload): Json<SignRequest>, secret: String) -> impl IntoResponse {
-    let claims = Claims {
-        sub: payload.sub,
-        exp: payload.exp,
-        iat: payload.iat,
-        iss: payload.iss,
-        aud: payload.aud,
-        custom: payload.custom,
-    };
-    let mut header = Header::default();
-    if let Some(kid) = payload.kid {
-        header.kid = Some(kid);
+/// Authentication middleware that skips certain paths
+async fn auth_middleware(api_key: Option<String>, req: Request, next: Next) -> Response {
+    // Skip auth for public endpoints
+    if should_skip_auth(req.uri().path()) {
+        return next.run(req).await;
     }
 
-    let alg_enum = match payload.alg.parse::<Algorithm>() {
-        Ok(a) => a,
-        Err(_) => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "UnsupportedAlgorithm",
-                format!("Algorithm '{}' is not supported", payload.alg),
-            )
-            .into_response();
-        }
-    };
-
-    header.alg = alg_enum;
-
-    let result = match alg_enum {
-        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
-            if secret.is_empty() {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingConfig",
-                    "JWT_SECRET is not configured for HMAC signing",
-                )
-                .into_response();
-            }
-            encode(
-                &header,
-                &claims,
-                &EncodingKey::from_secret(secret.as_bytes()),
-            )
-        }
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-            let key_data = match load_key("JWT_PRIVATE_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match EncodingKey::from_rsa_pem(&key_data) {
-                Ok(k) => encode(&header, &claims, &k),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)), // Convert to jsonwebtoken Error to match arm types
-            }
-        }
-        Algorithm::ES256 | Algorithm::ES384 => {
-            let key_data = match load_key("JWT_EC_PRIVATE_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match EncodingKey::from_ec_pem(&key_data) {
-                Ok(k) => encode(&header, &claims, &k),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
-            }
-        }
-        Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512 => {
-            let key_data = match load_key("JWT_PSS_PRIVATE_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match EncodingKey::from_rsa_pem(&key_data) {
-                Ok(k) => encode(&header, &claims, &k),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
-            }
-        }
-        _ => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "UnsupportedAlgorithm",
-                format!("Algorithm '{:?}' is not supported", alg_enum),
-            )
-            .into_response();
-        }
-    };
-
-    match result {
-        Ok(token) => Json(json!({"token": token})).into_response(),
-        Err(e) => {
-            error!("Signing error: {}", e);
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SignError",
-                format!("Failed to sign token: {}", e),
-            )
-            .into_response()
-        }
-    }
+    // Apply API key auth
+    auth::api_key_auth(api_key, req, next).await
 }
 
-async fn verify_jwt(Json(payload): Json<VerifyRequest>, secret: String) -> impl IntoResponse {
-    let header = match jsonwebtoken::decode_header(&payload.token) {
-        Ok(h) => h,
-        Err(e) => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "InvalidTokenHeader",
-                format!("Could not decode header: {}", e),
-            )
-            .into_response();
-        }
-    };
-    let alg = header.alg;
-    let mut validation = Validation::new(alg);
-    if let Ok(aud) = env::var("AUDIENCE") {
-        validation.set_audience(&[aud]);
-    }
-
-    // Attempt to decode
-    let result = match alg {
-        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
-            if secret.is_empty() {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MissingConfig",
-                    "JWT_SECRET is not configured for HMAC verification",
-                )
-                .into_response();
-            }
-            decode::<Claims>(
-                &payload.token,
-                &DecodingKey::from_secret(secret.as_bytes()),
-                &validation,
-            )
-        }
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-            let key_data = match load_key("JWT_PUBLIC_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match DecodingKey::from_rsa_pem(&key_data) {
-                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
-            }
-        }
-        Algorithm::ES256 | Algorithm::ES384 => {
-            let key_data = match load_key("JWT_EC_PUBLIC_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match DecodingKey::from_ec_pem(&key_data) {
-                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
-            }
-        }
-        Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512 => {
-            let key_data = match load_key("JWT_PSS_PUBLIC_KEY") {
-                Ok(k) => k,
-                Err(e) => return e.into_response(),
-            };
-            match DecodingKey::from_rsa_pem(&key_data) {
-                Ok(k) => decode::<Claims>(&payload.token, &k, &validation),
-                Err(e) => Err(jsonwebtoken::errors::Error::from(e)),
-            }
-        }
-        _ => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "UnsupportedAlgorithm",
-                format!("Algorithm '{:?}' is not supported", alg),
-            )
-            .into_response();
-        }
+/// Graceful shutdown signal handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
     };
 
-    match result {
-        Ok(data) => Json(json!({"claims": data.claims})).into_response(),
-        Err(err) => {
-            error!("JWT verification error: {:?}", err);
-            let kind = err.kind();
-            let (status, error_type, error_msg) = match kind {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => (
-                    StatusCode::UNAUTHORIZED,
-                    "ExpiredSignature",
-                    "Token has expired".to_string(),
-                ),
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => (
-                    StatusCode::UNAUTHORIZED,
-                    "InvalidSignature",
-                    "Invalid signature".to_string(),
-                ),
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => (
-                    StatusCode::BAD_REQUEST,
-                    "InvalidAudience",
-                    "Invalid audience".to_string(),
-                ),
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer => (
-                    StatusCode::BAD_REQUEST,
-                    "InvalidIssuer",
-                    "Invalid issuer".to_string(),
-                ),
-                jsonwebtoken::errors::ErrorKind::ImmatureSignature => (
-                    StatusCode::BAD_REQUEST,
-                    "ImmatureSignature",
-                    "Token is not yet valid (nbf claim)".to_string(),
-                ),
-                jsonwebtoken::errors::ErrorKind::InvalidToken => (
-                    StatusCode::BAD_REQUEST,
-                    "InvalidToken",
-                    "Token is malformed or invalid".to_string(),
-                ),
-                _ => (
-                    StatusCode::BAD_REQUEST,
-                    "VerificationError",
-                    err.to_string(),
-                ),
-            };
-            ApiError::new(status, error_type, error_msg).into_response()
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C, initiating graceful shutdown");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, initiating graceful shutdown");
         }
     }
-}
-
-async fn envs() -> impl IntoResponse {
-    let vars = [
-        "JWT_SECRET",
-        "JWT_PRIVATE_KEY",
-        "JWT_PUBLIC_KEY",
-        "JWT_PSS_PRIVATE_KEY",
-        "JWT_PSS_PUBLIC_KEY",
-        "JWT_EC_PRIVATE_KEY",
-        "JWT_EC_PUBLIC_KEY",
-        "BASE_URL",
-        "AUDIENCE",
-    ];
-
-    let mut result = serde_json::Map::new();
-
-    for var in vars {
-        let val = env::var(var).ok();
-        let exists = val.is_some();
-        let mut details = serde_json::Map::new();
-        details.insert("set".to_string(), json!(exists));
-
-        if let Some(v) = val {
-            // mask secret
-            if var == "JWT_SECRET" {
-                details.insert("value".to_string(), json!("***"));
-            } else if var.contains("KEY") && !var.contains("PUBLIC") {
-                // Private key paths are shown, but maybe we want to check if file exists
-                details.insert("path".to_string(), json!(v));
-                details.insert("file_exists".to_string(), json!(Path::new(&v).exists()));
-            } else {
-                details.insert("value".to_string(), json!(v));
-                if var.contains("KEY") || var.contains("CERT") {
-                    details.insert("file_exists".to_string(), json!(Path::new(&v).exists()));
-                }
-            }
-        }
-        result.insert(var.to_string(), json!(details));
-    }
-
-    Json(result)
 }

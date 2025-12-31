@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  jwts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5000
+      - RUST_LOG=jwts=info,tower_http=info
+      # HMAC secret for HS256/384/512
+      - JWT_SECRET=${JWT_SECRET:-}
+      # Rate limiting
+      - RATE_LIMIT_PER_SECOND=${RATE_LIMIT_PER_SECOND:-100}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-50}
+      # Optional API key for authentication
+      - API_KEY=${API_KEY:-}
+      # Audience validation
+      - AUDIENCE=${AUDIENCE:-}
+    volumes:
+      # Mount key files (uncomment and adjust paths as needed)
+      # - ./keys/rsa_private.pem:/app/keys/rsa_private.pem:ro
+      # - ./keys/rsa_public.pem:/app/keys/rsa_public.pem:ro
+      # - ./keys/ec_private.pem:/app/keys/ec_private.pem:ro
+      # - ./keys/ec_public.pem:/app/keys/ec_public.pem:ro
+      []
+    # Uncomment to use key files:
+    # environment:
+    #   - JWT_PRIVATE_KEY=/app/keys/rsa_private.pem
+    #   - JWT_PUBLIC_KEY=/app/keys/rsa_public.pem
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # Development variant with mounted source and hot reload
+  jwts-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command: cargo watch -x run
+    ports:
+      - "5000:5000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5000
+      - RUST_LOG=jwts=debug,tower_http=debug
+      - JWT_SECRET=dev-secret-do-not-use-in-production
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+    profiles:
+      - dev
+
+volumes:
+  cargo-cache:

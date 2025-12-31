@@ -8,6 +8,8 @@ Generate a 2048-bit RSA key pair:
 ```sh
 openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
 openssl rsa -in private.pem -pubout -out public.pem
+
+
 ```
 Set environment variables:
 ```
@@ -36,10 +38,17 @@ Generate a 2048-bit RSA key pair (same as RSA):
 openssl genpkey -algorithm RSA -out pss-private.pem -pkeyopt rsa_keygen_bits:2048
 openssl rsa -in pss-private.pem -pubout -out pss-public.pem
 ```
+
+
+Generate a ES384 key pair(P-384):
+```zsh
+openssl ecparam -genkey -name secp384r1 -noout -out ec384-private.pem
+openssl ec -in ec384-private.pem -pubout -out ec384-public.pem
+```
 Set environment variables:
 ```
 JWT_PSS_PRIVATE_KEY=</absolute/path/to/pss-private.pem>
 JWT_PSS_PUBLIC_KEY=</absolute/path/to/pss-public.pem>
 ```
 
-Use the appropriate `alg` in your /sign request: `HS256`, `RS256`, `ES256`, `PS256`, etc. 
+Use the appropriate `alg` in your /sign request: `HS256`, `RS256`, `ES256`, `PS256`, etc.

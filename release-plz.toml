@@ -1,0 +1,6 @@
+[workspace]
+changelog_update = true
+
+[[package]]
+name = "jwts"
+changelog_path = "CHANGELOG.md"
