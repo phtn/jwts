@@ -1,12 +1,57 @@
 [Unit]
-Description=JWTS Rust Service
+Description=JWTS - JWT Signing and Verification Service
+Documentation=https://github.com/your-repo/jwts
 After=network.target
+Wants=network-online.target
 
 [Service]
-User=ec2-user
-ExecStart=/home/ec2-user/deploy/jwts
+Type=simple
+User=jwts
+Group=jwts
+
+# Working directory
+WorkingDirectory=/opt/jwts
+
+# Environment file
+EnvironmentFile=/opt/jwts/config/jwts.env
+
+# Start command
+ExecStart=/opt/jwts/bin/jwts
+
+# Restart policy
 Restart=on-failure
-Environment=RUST_LOG=info
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Allow reading from /opt/jwts
+ReadOnlyPaths=/opt/jwts
+ReadWritePaths=
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jwts
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target
